@@ -262,6 +262,46 @@ def upload_trajectory_to_gcp(
             except Exception as e:
                 result["errors"].append(f"Failed to upload ui_states: {e}")
 
+        # Upload blind_run_ss folder
+        blind_run_ss_folder = folder_path / "blind_run_ss"
+        if blind_run_ss_folder.is_dir():
+            try:
+                uris = storage.upload_directory(
+                    str(blind_run_ss_folder),
+                    bucket_name,
+                    f"{gcp_prefix}/blind_run_ss",
+                    file_extensions=[".png"],
+                )
+                result["uploaded_files"].extend(uris)
+            except Exception as e:
+                result["errors"].append(f"Failed to upload blind_run_ss: {e}")
+
+        # Upload blind_run_log.json
+        blind_run_log = folder_path / "blind_run_log.json"
+        if blind_run_log.exists():
+            try:
+                uri = storage.upload_file(
+                    str(blind_run_log),
+                    bucket_name,
+                    f"{gcp_prefix}/blind_run_log.json",
+                )
+                result["uploaded_files"].append(uri)
+            except Exception as e:
+                result["errors"].append(f"Failed to upload blind_run_log.json: {e}")
+
+        # Upload graph_blind.json
+        graph_blind = folder_path / "graph_blind.json"
+        if graph_blind.exists():
+            try:
+                uri = storage.upload_file(
+                    str(graph_blind),
+                    bucket_name,
+                    f"{gcp_prefix}/graph_blind.json",
+                )
+                result["uploaded_files"].append(uri)
+            except Exception as e:
+                result["errors"].append(f"Failed to upload graph_blind.json: {e}")
+
         result["success"] = len(result["errors"]) == 0
 
         if result["success"]:
