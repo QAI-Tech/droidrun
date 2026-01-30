@@ -113,13 +113,43 @@ class GraphAgent:
             return asyncio.run(self._async_generate_graph())
 
     async def _async_generate_graph(self) -> dict:
-        """Async implementation of graph generation."""
+        """Async implementation of graph generation.
+
+        Runs all LLM calls concurrently using asyncio.gather for speed.
+        """
         nodes = []
         edges = []
 
-        # Generate node for initial screen state (before any action)
+        # Prepare all LLM tasks to run concurrently
+        # Task 0: initial screen description
+        # Tasks 1..N: step analysis (screen_name + edge_description)
+        tasks = [self._get_initial_screen_description()]
+
+        for i, entry in enumerate(self.blind_run_log):
+            node_idx = i + 1
+            before_bytes = self.screenshot_bytes_list[i] if i < len(self.screenshot_bytes_list) else None
+            after_bytes = self.screenshot_bytes_list[node_idx] if node_idx < len(self.screenshot_bytes_list) else None
+
+            tasks.append(
+                self._analyze_step(
+                    entry=entry,
+                    before_screenshot=before_bytes,
+                    after_screenshot=after_bytes,
+                )
+            )
+
+        # Run all LLM calls concurrently
+        logger.info(f"Running {len(tasks)} LLM calls concurrently for graph generation...")
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Process initial screen result
+        initial_description = "Initial Screen"
+        if not isinstance(results[0], Exception):
+            initial_description = results[0]
+        else:
+            logger.warning(f"Initial screen LLM failed: {results[0]}")
+
         initial_node_id = f"node-{self._run_id}-0"
-        initial_description = await self._get_initial_screen_description()
         initial_node = self._build_node(
             node_id=initial_node_id,
             index=0,
@@ -128,21 +158,19 @@ class GraphAgent:
         )
         nodes.append(initial_node)
 
-        # Generate nodes and edges for each action using single LLM call per step
+        # Process step results
         for i, entry in enumerate(self.blind_run_log):
-            node_idx = i + 1  # Node index (0 is initial)
+            node_idx = i + 1
             node_id = f"node-{self._run_id}-{node_idx}"
+            result = results[node_idx]  # results[0] is initial, results[1..N] are steps
 
-            # Get before and after screenshots
-            before_bytes = self.screenshot_bytes_list[i] if i < len(self.screenshot_bytes_list) else None
+            if isinstance(result, Exception):
+                logger.warning(f"Step {i} LLM failed: {result}")
+                screen_name, edge_description = self._fallback_step(entry)
+            else:
+                screen_name, edge_description = result
+
             after_bytes = self.screenshot_bytes_list[node_idx] if node_idx < len(self.screenshot_bytes_list) else None
-
-            # Single LLM call for both screen description and edge description
-            screen_name, edge_description = await self._analyze_step(
-                entry=entry,
-                before_screenshot=before_bytes,
-                after_screenshot=after_bytes,
-            )
 
             node = self._build_node(
                 node_id=node_id,
