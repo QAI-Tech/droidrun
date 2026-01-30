@@ -31,6 +31,19 @@ Examples: "Home Screen", "Search Results Page", "Login Form", "Product Details",
 
 Description:"""
 
+EDGE_DESCRIPTION_PROMPT = """You are describing a UI interaction on an Android app. Given the action code and the agent's reasoning, provide a concise professional description of what the user did.
+
+Action code:
+{action}
+
+Agent reasoning:
+{reasoning}
+
+Write a short, professional action label (3-8 words) describing this interaction.
+Examples: "Tap Settings button", "Enter email address", "Scroll down to Logout", "Select Deutschland from list", "Allow notification permission", "Navigate back to Home"
+
+Label:"""
+
 
 class GraphAgent:
     """
@@ -48,7 +61,7 @@ class GraphAgent:
     ):
         """
         Args:
-            llm: LlamaIndex LLM instance for generating screen descriptions.
+            llm: LlamaIndex LLM instance for generating descriptions.
             blind_run_log: List of blind run log entries (step, action, interaction, reasoning).
             screenshot_bytes_list: List of screenshot PNG bytes.
                 Index 0 = initial screen (before any action).
@@ -87,8 +100,6 @@ class GraphAgent:
         edges = []
 
         num_actions = len(self.blind_run_log)
-        # Total nodes = num_actions + 1 (initial screen + one per action result)
-        total_nodes = num_actions + 1
 
         # Generate node for initial screen state (before any action)
         initial_node_id = f"node-{self._run_id}-0"
@@ -113,6 +124,9 @@ class GraphAgent:
                 step_index=node_idx, is_initial=False, entry=entry
             )
 
+            # Get edge description via LLM
+            edge_description = await self._get_edge_description(entry)
+
             # Get screenshot bytes for this node
             screenshot_bytes = None
             if node_idx < len(self.screenshot_bytes_list):
@@ -134,6 +148,7 @@ class GraphAgent:
                 source_id=source_id,
                 target_id=node_id,
                 entry=entry,
+                description=edge_description,
             )
             edges.append(edge)
 
@@ -167,6 +182,7 @@ class GraphAgent:
         source_id: str,
         target_id: str,
         entry: Dict[str, Any],
+        description: str,
     ) -> dict:
         """Build an edge dict matching the graph export schema."""
         return {
@@ -179,7 +195,7 @@ class GraphAgent:
             "data": {
                 "business_logic": entry.get("action", ""),
                 "curvature": 0,
-                "description": entry.get("interaction", ""),
+                "description": description,
                 "source_anchor": "right-source",
                 "target_anchor": "left-target",
             },
@@ -201,6 +217,46 @@ class GraphAgent:
             logger.warning(f"Failed to encode screenshot as JPEG, using PNG: {e}")
             b64 = base64.b64encode(screenshot_bytes).decode("utf-8")
             return f"data:image/png;base64,{b64}"
+
+    async def _get_edge_description(self, entry: Dict[str, Any]) -> str:
+        """
+        Use LLM to generate a concise, professional action label for an edge.
+
+        Falls back to the interaction field if LLM is unavailable.
+        """
+        if self.llm is None:
+            return entry.get("interaction", "Perform action")
+
+        try:
+            from llama_index.core.base.llms.types import ChatMessage, MessageRole
+
+            prompt_text = EDGE_DESCRIPTION_PROMPT.format(
+                action=entry.get("action", "Unknown"),
+                reasoning=entry.get("reasoning", "")[:500],
+            )
+
+            messages = [ChatMessage(role=MessageRole.USER, content=prompt_text)]
+
+            response = await asyncio.wait_for(
+                self.llm.achat(messages=messages),
+                timeout=30,
+            )
+
+            if response and response.message and response.message.content:
+                label = response.message.content.strip()
+                # Clean up: remove quotes, extra whitespace, trailing punctuation
+                label = label.strip('"\'').strip().rstrip(".")
+                # Truncate if too long
+                if len(label) > 60:
+                    label = label[:57] + "..."
+                return label
+
+        except asyncio.TimeoutError:
+            logger.warning(f"LLM timeout for edge description at step {entry.get('step', '?')}")
+        except Exception as e:
+            logger.warning(f"LLM failed for edge description at step {entry.get('step', '?')}: {e}")
+
+        return entry.get("interaction", "Perform action")
 
     async def _get_screen_description(
         self,
