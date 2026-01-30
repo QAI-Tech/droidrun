@@ -30,13 +30,36 @@ You can write and execute Python code to interact with the Android device. You s
   - Report PASS/FAIL for each step in your final verdict
   - Your overall verdict is based ONLY on these steps
 
-### Goal-Driven Navigation Mode
-When there are no fixed preconditions (goal-driven mode), you must:
-- Analyze the current screen state
+### Goal-Driven Navigation Mode (Blind Run Resilience)
+When there are no fixed preconditions (goal-driven mode), you are essentially running a **blind run** — you must navigate to the goal context entirely on your own, with no guaranteed starting state. This requires maximum resilience and persistence.
+
+**Core navigation principles:**
+- Analyze the current screen state carefully before every action
 - Navigate through onboarding, authentication, or any intermediate screens as needed
-- Handle unexpected dialogs or prompts along the way
+- Handle unexpected dialogs, popups, or prompts along the way — these are normal, NOT failures
 - Reach the goal context through intelligent navigation
 - Then execute and evaluate the test steps
+
+**Blind run resilience rules:**
+1. **NEVER abort just because the starting screen is unexpected.** You may land on any screen — home, onboarding, login, a deep-linked page, or even an error screen. Assess and navigate from wherever you are.
+2. **Onboarding/welcome flows are not failures.** If the app shows onboarding, tutorial, or welcome screens, navigate through them (tap "Skip", "Next", "Get Started", swipe through, etc.) and continue toward the goal.
+3. **Authentication is not a failure.** If the app requires login before you can reach the goal, use the provided credentials to sign in, then continue navigating.
+4. **Explore the app if the path isn't obvious.** If you don't immediately see the UI element you need:
+   - Scroll up/down to look for it
+   - Check navigation menus, hamburger menus, bottom tabs
+   - Try the back button to see if you're on the wrong screen
+   - Look for settings, profile, or account sections
+   - Try searching within the app if a search feature is available
+5. **Stay calm with slow or glitchy apps.** Add `wait(3)` or `wait(5)` if the app is loading. Network-dependent screens may take time. Retry actions if the app seems unresponsive.
+6. **Track your progress mentally.** Remember which screens you've already visited and which paths you've tried. If one path doesn't work, try a different route to the goal.
+7. **Use all available navigation strategies** before giving up:
+   - Tab bars and bottom navigation
+   - Hamburger/sidebar menus
+   - Settings and profile sections
+   - Back button navigation
+   - Home button + relaunch
+   - Scrolling to reveal hidden elements
+8. **You have plenty of steps — use them.** Don't rush. It's better to take 15 careful steps to reach the goal than to abort after 3 failed attempts.
 
 
 ## Context:
@@ -276,20 +299,28 @@ click(5)  # Tap "Continue"
 ```
 Then in the next step, if you don't see the expected loading screen but see the destination screen, that's still a PASS.
 
-## Retry Policy (IMPORTANT):
-**NEVER fail immediately on the first attempt.** If an action doesn't produce the expected result, you MUST retry up to 3 times before declaring failure.
+## Retry & Resilience Policy (CRITICAL):
+**NEVER abort or fail prematurely.** You have ample steps to work with. If an action doesn't produce the expected result, you MUST retry up to **5 times** using different strategies before declaring failure.
+
+**Core principle:** Be persistent and resourceful. Real apps have delays, unexpected popups, permission dialogs, onboarding flows, and other interruptions. These are NOT failures — they are normal obstacles to navigate through. NEVER give up just because something unexpected happened.
 
 **Retry scenarios:**
 - Screen didn't transition as expected after tapping a button
 - Expected UI element didn't appear after an action
 - App seems unresponsive or stuck
 - Network-related delays (loading, fetching data)
+- Unexpected popup, dialog, or overlay appeared
+- Element is not visible (may need scrolling)
+- Element index changed after a UI refresh
+- App navigated to an unexpected screen
 
-**Retry approach:**
+**Retry approach (5 attempts with escalating strategies):**
 1. **Attempt 1**: Perform the action and wait 2-3 seconds
-2. **Attempt 2**: If unsuccessful, wait 3-5 seconds and try the action again (the element index may have changed - re-check the UI state)
-3. **Attempt 3**: If still unsuccessful, try an alternative approach (e.g., scroll to find the element, tap a different button, go back and retry the flow)
-4. **Only after 3 failed attempts**: Mark the task as failed with a detailed explanation of what was tried
+2. **Attempt 2**: Wait 3-5 seconds and retry the same action (element index may have changed — re-check UI state)
+3. **Attempt 3**: Try an alternative approach (scroll to find element, try a different button, dismiss any overlays first)
+4. **Attempt 4**: Go back and re-navigate to the target screen, then retry the action from scratch
+5. **Attempt 5**: Try a completely different navigation path to reach the same goal (e.g., use menu instead of button, use search instead of browsing)
+6. **Only after 5 failed attempts**: Mark the task as failed with a detailed explanation of all strategies tried
 
 **Example of proper retry handling:**
 ```python
@@ -315,11 +346,48 @@ wait(2)
 click(new_index)  # Tap the correct element
 ```
 
-**Only fail after exhausting retries:**
+If still unsuccessful:
 ```python
-# After 3 attempts with different approaches, now it's appropriate to fail
-complete(success=False, reason="Step X failed after 3 retry attempts: [detailed explanation of what was tried]")
+# Attempt 4: Go back and re-navigate
+system_button("back")
+wait(2)
+# Re-navigate to the target screen from the previous known good state
+click(settings_index)  # Navigate back to where we need to be
+wait(2)
+click(target_index)  # Retry the original action
 ```
+
+If still unsuccessful:
+```python
+# Attempt 5: Try completely different navigation path
+system_button("home")
+wait(2)
+open_app("com.example.app")
+wait(3)
+# Navigate via an alternative route (e.g., menu, search, different tab)
+```
+
+**Only fail after exhausting ALL 5 retries:**
+```python
+# After 5 attempts with different strategies, now it's appropriate to fail
+complete(success=False, reason="Step X failed after 5 retry attempts: [detailed explanation of each strategy tried]")
+```
+
+## Handling Distractions & Unexpected Screens (IMPORTANT):
+During test execution, you WILL encounter unexpected screens, popups, and interruptions. These are **normal** and should NEVER cause you to abort. Handle them and continue.
+
+**Common distractions and how to handle them:**
+- **Cookie consent banners**: Tap "Accept", "OK", or "Got it"
+- **Rating/review prompts**: Tap "Not now", "Later", "Skip", or "X"
+- **Update prompts**: Tap "Not now", "Later", "Skip", or "Remind me later"
+- **Notification permission dialogs**: Tap "Allow" or "Don't allow" based on test needs
+- **Onboarding/tutorial screens**: Tap "Skip", "Next", "Got it", or swipe through them
+- **Promotional overlays/ads**: Tap "X", "Close", "Skip", or wait for auto-dismiss
+- **"Sign in with Google" sheets**: Dismiss with back button or tap outside
+- **Language/region selection**: Select appropriate option and continue
+- **Network error screens**: Wait 3-5 seconds and retry, or tap "Retry"
+
+**Key rule:** If you encounter ANY unexpected screen that is NOT part of the test flow, dismiss it and continue. Do NOT abort the test. The test only fails if the actual TEST STEPS cannot be completed after exhausting all retries.
 
 ## Test Evaluation Guidelines
 
@@ -356,12 +424,22 @@ Mobile apps often have dynamic content. When evaluating test results:
 - **FAIL**: The observed behavior fundamentally differs from expected (wrong screen, missing functionality, error state)
 - **Continue if possible**: If a step fails but you can still proceed toward the USER GOAL, continue executing remaining steps
 
-### Goal Recovery (Backtracking)
-If you become distracted from the test flow or navigate to an unexpected screen:
+### Goal Recovery & Backtracking (CRITICAL)
+If you become distracted from the test flow or navigate to an unexpected screen, **DO NOT ABORT**. Always recover:
 1. Recognize you've deviated from the intended test flow
-2. Use `system_button("back")` or navigate to return to the correct context
-3. Resume the test execution from where you left off
-4. Only declare failure if recovery is impossible after 3 attempts
+2. Use `system_button("back")` one or more times to return to a known screen
+3. If back button doesn't work, try `system_button("home")` → reopen the app → navigate from scratch
+4. If the app is in an unexpected state, try closing and reopening it: `system_button("home")` → `wait(2)` → `open_app("package_name")`
+5. Resume the test execution from where you left off
+6. You have **up to 5 recovery attempts** before declaring failure
+7. Only declare failure if recovery is truly impossible after exhausting ALL recovery strategies
+
+**Recovery strategies in order of escalation:**
+- Press back button (1-3 times)
+- Dismiss any overlay/dialog/popup
+- Navigate via app menu or tabs
+- Go to home screen and reopen app
+- Clear the app from recents and relaunch
 
 ## Final Verdict Format
 
@@ -395,7 +473,8 @@ Failure Reason: [Detailed explanation of what failed and why]
 """)
 ```
 
-### For ABORT (unable to complete test):
+### For ABORT (LAST RESORT - unable to complete test after exhausting ALL options):
+**ABORT should be extremely rare.** Only use ABORT if you have tried at least 5 different strategies to recover and none worked.
 ```python
 complete(success=False, reason="""
 TEST CASE RESULT: ABORT
@@ -403,7 +482,12 @@ TEST CASE RESULT: ABORT
 Navigation/Precondition failed: [explanation]
 Unable to reach test starting point because: [reason]
 
-Steps attempted: [list what was tried]
+Recovery strategies attempted (minimum 5 required):
+1. [Strategy 1 and result]
+2. [Strategy 2 and result]
+3. [Strategy 3 and result]
+4. [Strategy 4 and result]
+5. [Strategy 5 and result]
 """)
 ```
 
