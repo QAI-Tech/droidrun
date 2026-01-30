@@ -8,41 +8,56 @@ from blind run log data and screenshots.
 import asyncio
 import base64
 import io
+import json
 import logging
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("droidrun")
 
-SCREEN_DESCRIPTION_PROMPT = """You are analyzing an Android app screenshot. This screenshot was taken after performing the following action:
-
-Action: {action}
-Context: {reasoning}
-
-Provide a concise 2-5 word description of the screen state shown in this screenshot.
-Examples: "Home Screen", "Search Results Page", "Login Form", "Product Details", "Shopping Cart"
-
-Description:"""
-
 INITIAL_SCREEN_PROMPT = """You are analyzing an Android app screenshot. This is the initial screen state before any test actions were performed.
 
-Provide a concise 2-5 word description of the screen state shown in this screenshot.
-Examples: "Home Screen", "Search Results Page", "Login Form", "Product Details", "Shopping Cart"
+Provide a concise 1-3 word name for this screen.
+Examples: "Home", "Login", "Onboarding", "Settings", "Search"
 
-Description:"""
+Respond in this exact JSON format:
+{"screen_name": "<1-3 word screen name>"}"""
 
-EDGE_DESCRIPTION_PROMPT = """You are describing a UI interaction on an Android app. Given the action code and the agent's reasoning, provide a concise professional description of what the user did.
+STEP_ANALYSIS_PROMPT = """You are analyzing a UI test step on an Android app.
 
-Action code:
-{action}
+You are given:
+1. BEFORE screenshot: the screen state before the action
+2. AFTER screenshot: the screen state after the action
+3. The code that was executed
+4. The agent's reasoning
+
+Code executed:
+{code}
 
 Agent reasoning:
 {reasoning}
 
-Write a short, professional action label (3-8 words) describing this interaction.
-Examples: "Tap Settings button", "Enter email address", "Scroll down to Logout", "Select Deutschland from list", "Allow notification permission", "Navigate back to Home"
+Provide:
+- screen_name: A concise 1-3 word name for the AFTER screen (e.g. "Home", "Settings", "Login Form", "Search Results")
+- edge_description: A short professional description (max 10-15 words) of the action performed (e.g. "Tap on Settings icon", "Enter email address in login field", "Scroll down to Logout button")
 
-Label:"""
+Respond in this exact JSON format:
+{{"screen_name": "<1-3 word screen name>", "edge_description": "<10-15 word action description>"}}"""
+
+STEP_ANALYSIS_NO_IMAGES_PROMPT = """You are analyzing a UI test step on an Android app.
+
+Code executed:
+{code}
+
+Agent reasoning:
+{reasoning}
+
+Provide:
+- screen_name: A concise 1-3 word name for the screen after this action (e.g. "Home", "Settings", "Login Form", "Search Results")
+- edge_description: A short professional description (max 10-15 words) of the action performed (e.g. "Tap on Settings icon", "Enter email address in login field", "Scroll down to Logout button")
+
+Respond in this exact JSON format:
+{{"screen_name": "<1-3 word screen name>", "edge_description": "<10-15 word action description>"}}"""
 
 
 class GraphAgent:
@@ -51,6 +66,9 @@ class GraphAgent:
 
     Each node represents a screen state (with screenshot + LLM-generated description).
     Each edge represents an action transitioning between screen states.
+
+    Uses a single LLM call per step with before + after screenshots for better
+    context and efficiency.
     """
 
     def __init__(
@@ -99,13 +117,9 @@ class GraphAgent:
         nodes = []
         edges = []
 
-        num_actions = len(self.blind_run_log)
-
         # Generate node for initial screen state (before any action)
         initial_node_id = f"node-{self._run_id}-0"
-        initial_description = await self._get_screen_description(
-            step_index=0, is_initial=True
-        )
+        initial_description = await self._get_initial_screen_description()
         initial_node = self._build_node(
             node_id=initial_node_id,
             index=0,
@@ -114,29 +128,27 @@ class GraphAgent:
         )
         nodes.append(initial_node)
 
-        # Generate nodes and edges for each action
+        # Generate nodes and edges for each action using single LLM call per step
         for i, entry in enumerate(self.blind_run_log):
             node_idx = i + 1  # Node index (0 is initial)
             node_id = f"node-{self._run_id}-{node_idx}"
 
-            # Get screen description via LLM
-            description = await self._get_screen_description(
-                step_index=node_idx, is_initial=False, entry=entry
+            # Get before and after screenshots
+            before_bytes = self.screenshot_bytes_list[i] if i < len(self.screenshot_bytes_list) else None
+            after_bytes = self.screenshot_bytes_list[node_idx] if node_idx < len(self.screenshot_bytes_list) else None
+
+            # Single LLM call for both screen description and edge description
+            screen_name, edge_description = await self._analyze_step(
+                entry=entry,
+                before_screenshot=before_bytes,
+                after_screenshot=after_bytes,
             )
-
-            # Get edge description via LLM
-            edge_description = await self._get_edge_description(entry)
-
-            # Get screenshot bytes for this node
-            screenshot_bytes = None
-            if node_idx < len(self.screenshot_bytes_list):
-                screenshot_bytes = self.screenshot_bytes_list[node_idx]
 
             node = self._build_node(
                 node_id=node_id,
                 index=node_idx,
-                description=description,
-                screenshot_bytes=screenshot_bytes,
+                description=screen_name,
+                screenshot_bytes=after_bytes,
             )
             nodes.append(node)
 
@@ -153,6 +165,187 @@ class GraphAgent:
             edges.append(edge)
 
         return {"nodes": nodes, "edges": edges}
+
+    async def _get_initial_screen_description(self) -> str:
+        """Get LLM description for the initial screen (before any action)."""
+        if self.llm is None:
+            return "Initial Screen"
+
+        try:
+            from llama_index.core.base.llms.types import (
+                ChatMessage,
+                ImageBlock,
+                MessageRole,
+                TextBlock,
+            )
+
+            blocks = [TextBlock(text=INITIAL_SCREEN_PROMPT)]
+
+            # Add screenshot if available
+            screenshot_bytes = self.screenshot_bytes_list[0] if self.screenshot_bytes_list else None
+            if screenshot_bytes:
+                blocks.append(ImageBlock(image=screenshot_bytes))
+
+            messages = [ChatMessage(role=MessageRole.USER, blocks=blocks)]
+
+            response = await asyncio.wait_for(
+                self.llm.achat(messages=messages),
+                timeout=30,
+            )
+
+            if response and response.message and response.message.content:
+                return self._parse_screen_name(response.message.content)
+
+        except asyncio.TimeoutError:
+            logger.warning("LLM timeout for initial screen description")
+        except Exception as e:
+            logger.warning(f"LLM failed for initial screen description: {e}")
+
+        return "Initial Screen"
+
+    async def _analyze_step(
+        self,
+        entry: Dict[str, Any],
+        before_screenshot: Optional[bytes],
+        after_screenshot: Optional[bytes],
+    ) -> Tuple[str, str]:
+        """
+        Analyze a single step using LLM with before/after screenshots + code + reasoning.
+
+        Returns:
+            Tuple of (screen_name, edge_description)
+        """
+        if self.llm is None:
+            return self._fallback_step(entry)
+
+        try:
+            from llama_index.core.base.llms.types import (
+                ChatMessage,
+                ImageBlock,
+                MessageRole,
+                TextBlock,
+            )
+
+            code = entry.get("action", "Unknown")
+            reasoning = entry.get("reasoning", "")[:500]
+
+            has_images = before_screenshot is not None or after_screenshot is not None
+
+            if has_images:
+                prompt_text = STEP_ANALYSIS_PROMPT.format(
+                    code=code,
+                    reasoning=reasoning,
+                )
+                blocks = []
+
+                # Add before screenshot
+                if before_screenshot:
+                    blocks.append(TextBlock(text="BEFORE screenshot:"))
+                    blocks.append(ImageBlock(image=before_screenshot))
+                else:
+                    blocks.append(TextBlock(text="BEFORE screenshot: (not available)"))
+
+                # Add after screenshot
+                if after_screenshot:
+                    blocks.append(TextBlock(text="AFTER screenshot:"))
+                    blocks.append(ImageBlock(image=after_screenshot))
+                else:
+                    blocks.append(TextBlock(text="AFTER screenshot: (not available)"))
+
+                # Add the analysis prompt
+                blocks.append(TextBlock(text=prompt_text))
+            else:
+                # No images available, use text-only prompt
+                prompt_text = STEP_ANALYSIS_NO_IMAGES_PROMPT.format(
+                    code=code,
+                    reasoning=reasoning,
+                )
+                blocks = [TextBlock(text=prompt_text)]
+
+            messages = [ChatMessage(role=MessageRole.USER, blocks=blocks)]
+
+            response = await asyncio.wait_for(
+                self.llm.achat(messages=messages),
+                timeout=30,
+            )
+
+            if response and response.message and response.message.content:
+                return self._parse_step_response(response.message.content, entry)
+
+        except asyncio.TimeoutError:
+            logger.warning(f"LLM timeout for step {entry.get('step', '?')}")
+        except Exception as e:
+            logger.warning(f"LLM failed for step {entry.get('step', '?')}: {e}")
+
+        return self._fallback_step(entry)
+
+    def _parse_screen_name(self, response_text: str) -> str:
+        """Parse screen name from LLM JSON response."""
+        try:
+            # Try to extract JSON from response
+            text = response_text.strip()
+            # Handle cases where LLM wraps in markdown code block
+            if "```" in text:
+                text = text.split("```")[1]
+                if text.startswith("json"):
+                    text = text[4:]
+                text = text.strip()
+
+            data = json.loads(text)
+            name = data.get("screen_name", "").strip().strip("\"'")
+            if name and len(name) <= 50:
+                return name
+        except (json.JSONDecodeError, AttributeError, KeyError):
+            # Try to extract just the name from plain text
+            text = response_text.strip().strip("\"'").strip()
+            if text and len(text) <= 50:
+                return text
+
+        return "Initial Screen"
+
+    def _parse_step_response(
+        self, response_text: str, entry: Dict[str, Any]
+    ) -> Tuple[str, str]:
+        """Parse screen_name and edge_description from LLM JSON response."""
+        try:
+            text = response_text.strip()
+            # Handle markdown code block wrapping
+            if "```" in text:
+                text = text.split("```")[1]
+                if text.startswith("json"):
+                    text = text[4:]
+                text = text.strip()
+
+            data = json.loads(text)
+            screen_name = data.get("screen_name", "").strip().strip("\"'")
+            edge_desc = data.get("edge_description", "").strip().strip("\"'").rstrip(".")
+
+            if not screen_name:
+                screen_name = self._fallback_step(entry)[0]
+            if not edge_desc:
+                edge_desc = self._fallback_step(entry)[1]
+
+            # Truncate if needed
+            if len(screen_name) > 50:
+                screen_name = screen_name[:47] + "..."
+            if len(edge_desc) > 80:
+                edge_desc = edge_desc[:77] + "..."
+
+            return screen_name, edge_desc
+
+        except (json.JSONDecodeError, AttributeError, KeyError):
+            logger.warning(
+                f"Failed to parse LLM JSON for step {entry.get('step', '?')}, "
+                f"raw response: {response_text[:200]}"
+            )
+
+        return self._fallback_step(entry)
+
+    def _fallback_step(self, entry: Dict[str, Any]) -> Tuple[str, str]:
+        """Generate fallback descriptions without LLM."""
+        screen_name = f"Screen {entry.get('step', '?')}"
+        edge_desc = entry.get("interaction", "Perform action")
+        return screen_name, edge_desc
 
     def _build_node(
         self,
@@ -217,134 +410,3 @@ class GraphAgent:
             logger.warning(f"Failed to encode screenshot as JPEG, using PNG: {e}")
             b64 = base64.b64encode(screenshot_bytes).decode("utf-8")
             return f"data:image/png;base64,{b64}"
-
-    async def _get_edge_description(self, entry: Dict[str, Any]) -> str:
-        """
-        Use LLM to generate a concise, professional action label for an edge.
-
-        Falls back to the interaction field if LLM is unavailable.
-        """
-        if self.llm is None:
-            return entry.get("interaction", "Perform action")
-
-        try:
-            from llama_index.core.base.llms.types import ChatMessage, MessageRole
-
-            prompt_text = EDGE_DESCRIPTION_PROMPT.format(
-                action=entry.get("action", "Unknown"),
-                reasoning=entry.get("reasoning", "")[:500],
-            )
-
-            messages = [ChatMessage(role=MessageRole.USER, content=prompt_text)]
-
-            response = await asyncio.wait_for(
-                self.llm.achat(messages=messages),
-                timeout=30,
-            )
-
-            if response and response.message and response.message.content:
-                label = response.message.content.strip()
-                # Clean up: remove quotes, extra whitespace, trailing punctuation
-                label = label.strip('"\'').strip().rstrip(".")
-                # Truncate if too long
-                if len(label) > 60:
-                    label = label[:57] + "..."
-                return label
-
-        except asyncio.TimeoutError:
-            logger.warning(f"LLM timeout for edge description at step {entry.get('step', '?')}")
-        except Exception as e:
-            logger.warning(f"LLM failed for edge description at step {entry.get('step', '?')}: {e}")
-
-        return entry.get("interaction", "Perform action")
-
-    async def _get_screen_description(
-        self,
-        step_index: int,
-        is_initial: bool = False,
-        entry: Optional[Dict[str, Any]] = None,
-    ) -> str:
-        """
-        Use LLM to generate a short description of the screen state.
-
-        Falls back to a default description if LLM is unavailable or fails.
-        """
-        if self.llm is None:
-            return self._fallback_description(step_index, is_initial, entry)
-
-        try:
-            from llama_index.core.base.llms.types import ChatMessage, MessageRole
-
-            # Build prompt
-            if is_initial:
-                prompt_text = INITIAL_SCREEN_PROMPT
-            else:
-                prompt_text = SCREEN_DESCRIPTION_PROMPT.format(
-                    action=entry.get("action", "Unknown") if entry else "Unknown",
-                    reasoning=entry.get("reasoning", "")[:300] if entry else "",
-                )
-
-            messages = [ChatMessage(role=MessageRole.USER, content=prompt_text)]
-
-            # Add screenshot as image if available and LLM supports it
-            screenshot_bytes = None
-            if step_index < len(self.screenshot_bytes_list):
-                screenshot_bytes = self.screenshot_bytes_list[step_index]
-
-            if screenshot_bytes:
-                # Try multimodal message with image
-                try:
-                    b64_image = base64.b64encode(screenshot_bytes).decode("utf-8")
-                    messages = [
-                        ChatMessage(
-                            role=MessageRole.USER,
-                            content=[
-                                {"type": "text", "text": prompt_text},
-                                {
-                                    "type": "image_url",
-                                    "image_url": {
-                                        "url": f"data:image/png;base64,{b64_image}"
-                                    },
-                                },
-                            ],
-                        )
-                    ]
-                except Exception:
-                    # Fall back to text-only if multimodal fails
-                    pass
-
-            response = await asyncio.wait_for(
-                self.llm.achat(messages=messages),
-                timeout=30,
-            )
-
-            if response and response.message and response.message.content:
-                description = response.message.content.strip()
-                # Clean up: remove quotes, extra whitespace
-                description = description.strip('"\'').strip()
-                # Truncate if too long
-                if len(description) > 50:
-                    description = description[:47] + "..."
-                return description
-
-        except asyncio.TimeoutError:
-            logger.warning(f"LLM timeout for screen description at step {step_index}")
-        except Exception as e:
-            logger.warning(f"LLM failed for screen description at step {step_index}: {e}")
-
-        return self._fallback_description(step_index, is_initial, entry)
-
-    def _fallback_description(
-        self,
-        step_index: int,
-        is_initial: bool,
-        entry: Optional[Dict[str, Any]],
-    ) -> str:
-        """Generate a fallback description without LLM."""
-        if is_initial:
-            return "Initial Screen"
-        if entry:
-            interaction = entry.get("interaction", "")
-            if interaction:
-                return f"After: {interaction[:40]}"
-        return f"Screen State {step_index}"
