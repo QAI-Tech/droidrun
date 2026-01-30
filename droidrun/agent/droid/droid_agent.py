@@ -998,6 +998,24 @@ class DroidAgent(Workflow):
             await self.trajectory_writer.stop()
             logger.info(f"📁 Trajectory saved: {self.trajectory.trajectory_folder}")
 
+            # Blind Run post-processing
+            try:
+                from droidrun.agent.blind_run.processor import BlindRunProcessor
+
+                blind_run_processor = BlindRunProcessor(
+                    shared_state=self.shared_state,
+                    trajectory=self.trajectory,
+                    trajectory_folder=self.trajectory.trajectory_folder,
+                    llm=getattr(self, "app_opener_llm", None),
+                )
+                blind_run_result = blind_run_processor.process()
+                logger.info(f"📊 Blind run artifacts generated: {blind_run_result}")
+            except Exception as e:
+                logger.warning(f"⚠️ Blind run post-processing failed: {e}")
+                if self.config.logging.debug:
+                    import traceback
+                    logger.error(traceback.format_exc())
+
             # Upload to GCP if enabled
             if self.config.logging.gcp.enabled:
                 try:
