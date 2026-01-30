@@ -113,31 +113,77 @@ class BlindRunProcessor:
 
         logger.info(f"Saved {copied} blind run screenshots to {self.blind_run_ss_folder}")
 
-    def _extract_interaction_summary(self, thought: str) -> str:
-        """Extract a concise interaction description from the full thought text."""
-        if not thought:
-            return "Unknown interaction"
+    def _extract_interaction_summary(self, code: str, thought: str) -> str:
+        """
+        Extract a concise, professional action label from the code and thought.
 
-        # Take the first meaningful line as the interaction summary
-        lines = [line.strip() for line in thought.strip().split("\n") if line.strip()]
-        if lines:
-            first_line = lines[0]
-            # Remove common prefixes
-            for prefix in [
-                "(Navigation) Agent Analysis:",
-                "(STEP",
-                "Agent Analysis:",
-                "**",
-            ]:
-                if first_line.startswith(prefix):
-                    first_line = first_line[len(prefix) :].strip()
-                    # Remove trailing ** if markdown
-                    if first_line.endswith("**"):
-                        first_line = first_line[:-2].strip()
-                    break
-            # Truncate if too long
-            if len(first_line) > 150:
-                first_line = first_line[:147] + "..."
+        Prioritizes the code comment (e.g. "# STEP 1: Tap Settings option") for a
+        clean action description. Falls back to parsing function calls from code.
+        """
+        import re
+
+        # 1. Try extracting from code comment (the first # comment line)
+        if code:
+            for line in code.strip().split("\n"):
+                line = line.strip()
+                if line.startswith("#"):
+                    comment = line.lstrip("#").strip()
+                    # Remove step/navigation prefixes for cleaner labels
+                    comment = re.sub(
+                        r"^(STEP\s*\d+\s*:\s*|Navigation\s*:\s*)", "", comment
+                    ).strip()
+                    if comment:
+                        return comment
+
+        # 2. Fall back to parsing the action function calls from code
+        if code:
+            actions = []
+            for line in code.strip().split("\n"):
+                line = line.strip()
+                if line.startswith("#") or not line:
+                    continue
+                # Match function calls like click(5), type("text", 3), swipe(...)
+                match = re.match(r"(click|long_press|type|swipe|press_key|system_button|open_app|open_url|wait)\s*\(", line)
+                if match:
+                    func = match.group(1)
+                    if func == "click":
+                        actions.append("Tap element")
+                    elif func == "long_press":
+                        actions.append("Long press element")
+                    elif func == "type":
+                        # Extract the text being typed
+                        type_match = re.match(r'type\s*\(\s*["\'](.+?)["\']', line)
+                        if type_match:
+                            text = type_match.group(1)
+                            if len(text) > 30:
+                                text = text[:27] + "..."
+                            actions.append(f'Type "{text}"')
+                        else:
+                            actions.append("Type text")
+                    elif func == "swipe":
+                        actions.append("Swipe gesture")
+                    elif func == "press_key":
+                        actions.append("Press key")
+                    elif func == "system_button":
+                        btn_match = re.match(r'system_button\s*\(\s*["\'](.+?)["\']', line)
+                        if btn_match:
+                            actions.append(f'Press {btn_match.group(1)}')
+                        else:
+                            actions.append("Press system button")
+                    elif func == "open_app":
+                        actions.append("Open app")
+                    elif func == "open_url":
+                        actions.append("Open URL")
+                    elif func == "wait":
+                        pass  # Skip waits in descriptions
+            if actions:
+                return ", ".join(actions)
+
+        # 3. Last resort: use thought
+        if thought:
+            first_line = thought.strip().split("\n")[0].strip()
+            if len(first_line) > 80:
+                first_line = first_line[:77] + "..."
             return first_line
 
         return "Unknown interaction"
@@ -171,7 +217,7 @@ class BlindRunProcessor:
                 "step": i,
                 "screenshot": screenshot_path,
                 "action": code,
-                "interaction": self._extract_interaction_summary(thought),
+                "interaction": self._extract_interaction_summary(code, thought),
                 "reasoning": thought,
             }
             self._blind_run_log.append(entry)
